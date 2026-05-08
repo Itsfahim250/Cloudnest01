@@ -51,10 +51,6 @@ PROXY_SESSIONS_FILE = os.path.join(DATA_DIR, "proxy_sessions.json")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# =============================================================================
-# PYTHONANYWHERE PROXY FIX
-# =============================================================================
-
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None, threaded=False)
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
@@ -156,36 +152,26 @@ def revoke_proxy_session(token):
     save_proxy_sessions(sessions)
 
 def get_api_key_from_request(req):
-    # JSON বডি থেকে ডাটা নেওয়ার চেষ্টা করবে
     data = req.get_json(silent=True) or {}
-    
-    # JSON, URL (args), অথবা Form Data থেকে API Key খুঁজবে
     direct_key = (
-        data.get("api_key") 
-        or req.args.get("api_key") 
+        data.get("api_key")
+        or req.args.get("api_key")
         or req.form.get("api_key")
     )
-    
-    # যদি বডি বা URL-এ না পায়, তবে Header থেকে খুঁজবে
     if not direct_key:
         auth_header = req.headers.get("Authorization")
         if auth_header:
             direct_key = auth_header.replace("Bearer ", "").strip()
-            
     if direct_key:
         return direct_key
-        
-    # যদি API Key না থাকে, তবে Session Token খুঁজবে
     session_token = (
         data.get("session_token")
         or req.args.get("session_token")
         or req.form.get("session_token")
         or req.cookies.get("cn_session")
     )
-    
     if session_token:
         return resolve_proxy_session(session_token)
-        
     return None
 
 # =============================================================================
@@ -223,10 +209,14 @@ save_urls = lambda data: save_json_file(URL_DB_FILE, data)
 def is_admin(chat_id): return str(chat_id) in ADMIN_CHAT_IDS
 
 def get_public_base_url():
+    # Render এ RENDER_EXTERNAL_URL environment variable থাকে
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+    if render_url:
+        return render_url.rstrip("/")
     try:
         if request and request.url_root: return request.url_root.rstrip("/")
     except Exception: pass
-    return "https://cloudnest.pythonanywhere.com"
+    return "https://cloudnest.onrender.com"
 
 def get_logged_in_user(chat_id):
     sessions = load_sessions()
@@ -243,6 +233,9 @@ def get_user_by_api_key(api_key):
     return None, None
 
 def is_premium(user_info, feature):
+    # Admin সবসময় unlimited
+    if user_info.get("is_admin"):
+        return True
     prem_data = user_info.get("premium", {})
     now = time.time()
     if prem_data.get("all", 0) > now: return True
@@ -252,7 +245,9 @@ def is_premium(user_info, feature):
 def consume_feature(user_email, feature, amount=1):
     users = load_users()
     user_info = users.get(user_email, {})
-    if is_premium(user_info, feature): return True, user_info
+    # Admin বা premium হলে সরাসরি allow
+    if user_info.get("is_admin") or is_premium(user_info, feature):
+        return True, user_info
 
     now = datetime.now(timezone.utc)
     last_reset = user_info.get("usage_last_reset", "2000-01")
@@ -270,17 +265,81 @@ def consume_feature(user_email, feature, amount=1):
     return True, user_info
 
 def usage_summary(user_info):
-    lines =[]
+    lines = []
     now = time.time()
     prem = user_info.get("premium", {})
+    is_adm = user_info.get("is_admin", False)
     for feature, display in FREE_LIMITS_DISPLAY.items():
-        if prem.get("all", 0) > now or prem.get(feature, 0) > now:
-            lines.append(f"- {feature.replace('_', ' ').title()}: ♾️ Unlimited (Premium)")
+        if is_adm or prem.get("all", 0) > now or prem.get(feature, 0) > now:
+            lines.append(f"- {feature.replace('_', ' ').title()}: ♾️ Unlimited {'(Admin)' if is_adm else '(Premium)'}")
         else:
             used = (user_info.get("usage") or {}).get(feature, 0)
             lines.append(f"- {feature.replace('_', ' ').title()}: {used} / {display}")
     lines.append("- Temp Mail: Unlimited")
     return "\n".join(lines)
+
+# =============================================================================
+# AUTO REGISTER/LOGIN BY TELEGRAM CHAT_ID
+# =============================================================================
+
+def get_or_create_user_by_chat_id(chat_id):
+    """
+    Telegram chat_id দিয়ে auto user তৈরি বা load করে।
+    Login/Register step দরকার নেই।
+    """
+    chat_id = str(chat_id)
+    sessions = load_sessions()
+    users = load_users()
+
+    # Already logged in?
+    if chat_id in sessions:
+        user_email = sessions[chat_id]
+        if user_email in users:
+            return user_email, users[user_email]
+
+    # pseudo-email হিসেবে chat_id ব্যবহার
+    pseudo_email = f"tg_{chat_id}@cloudnest.internal"
+
+    if pseudo_email not in users:
+        api_key = "cn_" + uuid.uuid4().hex
+        is_adm = chat_id in ADMIN_CHAT_IDS
+
+        # Admin হলে unlimited
+        new_user = {
+            "email": pseudo_email,
+            "api_key": api_key,
+            "chat_id": chat_id,
+            "created_at": now_iso(),
+            "usage": {},
+            "premium": {},
+            "is_admin": is_adm
+        }
+        # Admin এর জন্য special unlimited API key prefix
+        if is_adm:
+            new_user["api_key"] = "cn_admin_" + uuid.uuid4().hex
+
+        users[pseudo_email] = new_user
+        save_users(users)
+
+    # Session set
+    sessions[chat_id] = pseudo_email
+    save_sessions(sessions)
+
+    return pseudo_email, users[pseudo_email]
+
+def ensure_admin_unlimited(chat_id):
+    """Admin এর api_key এর is_admin flag সবসময় True রাখে।"""
+    chat_id = str(chat_id)
+    if chat_id not in ADMIN_CHAT_IDS:
+        return
+    users = load_users()
+    pseudo_email = f"tg_{chat_id}@cloudnest.internal"
+    if pseudo_email in users:
+        if not users[pseudo_email].get("is_admin"):
+            users[pseudo_email]["is_admin"] = True
+            if not users[pseudo_email]["api_key"].startswith("cn_admin_"):
+                users[pseudo_email]["api_key"] = "cn_admin_" + uuid.uuid4().hex
+            save_users(users)
 
 # =============================================================================
 # OTP EMAIL TEMPLATES
@@ -305,11 +364,11 @@ def send_premium_otp_email(to_email, otp_code):
                         <tr>
                             <td align="center" style="padding:40px 30px;">
                                 <h2 style="color:#1c1e21; font-size:20px; margin:0 0 15px 0; font-weight: 600;">Authentication Required</h2>
-                                <p style="color:#606770; font-size:15px; margin:0 0 25px 0; line-height: 1.5;">You've requested a security code to verify your CloudNest Bot account. Please enter the code below:</p>
+                                <p style="color:#606770; font-size:15px; margin:0 0 25px 0; line-height: 1.5;">Enter the code below to verify your CloudNest account:</p>
                                 <div style="background-color:#e7f3ff; border:1px solid #1877f2; border-radius:6px; padding:15px 30px; display:inline-block; margin-bottom: 25px;">
                                     <span style="color:#1877f2; font-size:36px; font-weight:bold; letter-spacing:5px;">{otp_code}</span>
                                 </div>
-                                <p style="color:#8a8d91; font-size:13px; margin:0; line-height: 1.4;">If you didn't request this code, you can safely ignore this email. Someone else might have typed your email address by mistake.</p>
+                                <p style="color:#8a8d91; font-size:13px; margin:0; line-height: 1.4;">If you didn't request this code, you can safely ignore this email.</p>
                             </td>
                         </tr>
                     </table>
@@ -350,20 +409,12 @@ def send_api_otp_email(to_email, otp_code, is_premium_user=False):
         </tr>
         <tr>
           <td style="padding:40px 40px 32px 40px;text-align:center;">
-            <div style="width:56px;height:56px;background:#e7f3ff;border-radius:50%;margin:0 auto 20px;display:flex;align-items:center;justify-content:center;">
-              <span style="font-size:26px;">🔐</span>
-            </div>
             <h2 style="color:#1c1e21;font-size:22px;font-weight:700;margin:0 0 10px;">Security Verification</h2>
-            <p style="color:#606770;font-size:14px;line-height:1.6;margin:0 0 28px;">Use this one-time code to complete your verification. Do not share it with anyone.</p>
+            <p style="color:#606770;font-size:14px;line-height:1.6;margin:0 0 28px;">Use this one-time code to complete your verification.</p>
             <div style="background:#f0f7ff;border:2px solid #1877f2;border-radius:10px;padding:18px 36px;display:inline-block;margin-bottom:28px;">
               <span style="color:#1877f2;font-size:40px;font-weight:800;letter-spacing:8px;font-family:'Courier New',monospace;">{otp_code}</span>
             </div>
-            <p style="color:#bec3c9;font-size:12px;margin:0;line-height:1.5;">⏱ This code expires in <strong>5 minutes</strong>.<br>If you didn't request this, please ignore this email.</p>
-          </td>
-        </tr>
-        <tr>
-          <td style="background:#f7f8fa;padding:18px 40px;text-align:center;border-top:1px solid #e4e6ea;">
-            <p style="color:#bec3c9;font-size:11px;margin:0;">This is an automated security message. Please do not reply.</p>
+            <p style="color:#bec3c9;font-size:12px;margin:0;line-height:1.5;">⏱ This code expires in <strong>5 minutes</strong>.</p>
           </td>
         </tr>
       </table>
@@ -460,10 +511,10 @@ def create_temp_email_account(service="mail.tm"):
                     time.sleep(1); continue
 
                 domain_data = domain_resp.json()
-                members = domain_data.get("hydra:member",[])
+                members = domain_data.get("hydra:member", [])
                 if not members: break
 
-                active_domains =[d for d in members if d.get("isActive", True)]
+                active_domains = [d for d in members if d.get("isActive", True)]
                 if not active_domains: active_domains = members
                 domain = active_domains[0].get("domain", "")
                 if not domain: continue
@@ -497,9 +548,9 @@ def get_temp_email_inbox(token, service):
         resp = requests.get(f"{MAIL_APIS[service]['base_url']}/messages", headers=headers, timeout=15)
         if resp.status_code == 200:
             return resp.json().get("hydra:member", [])
-        return[]
+        return []
     except Exception as e:
-        return[]
+        return []
 
 # =============================================================================
 # WEB SOURCE FETCHER
@@ -516,7 +567,7 @@ def _is_blocked_url(url: str) -> bool:
         return False
     except Exception: return True
 
-_USER_AGENTS =[
+_USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
@@ -541,7 +592,7 @@ def _fetch_with_session(url: str, ua: str, timeout: int = 15) -> requests.Respon
     return resp
 
 def _smart_fetch(target_url: str):
-    for ua in[_USER_AGENTS[0], _USER_AGENTS[1]]:
+    for ua in [_USER_AGENTS[0], _USER_AGENTS[1]]:
         try:
             resp = _fetch_with_session(target_url, ua=ua, timeout=12)
             if resp.status_code < 500: return resp, "chrome_desktop", None
@@ -552,29 +603,40 @@ def _smart_fetch(target_url: str):
 # =============================================================================
 # KEYBOARDS
 # =============================================================================
-def auth_welcome_keyboard():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add(types.KeyboardButton("Register"), types.KeyboardButton("Login"))
-    return markup
-
 def main_keyboard(chat_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    buttons =[
+    buttons = [
         types.KeyboardButton("📧 Temp Mail"),
         types.KeyboardButton("🌐 Your Websites"),
         types.KeyboardButton("⚙️ Project Settings"),
         types.KeyboardButton("💎 Redeem Premium"),
-        types.KeyboardButton("Logout")
     ]
     if is_admin(chat_id):
         buttons.insert(0, types.KeyboardButton("🔑 Gen Premium"))
+        buttons.append(types.KeyboardButton("👑 Admin Panel"))
         buttons.append(types.KeyboardButton("🗑️ Clear Database"))
     markup.add(*buttons)
     return markup
 
 # =============================================================================
-# FLASK API ROUTES
+# FLASK ROUTES
 # =============================================================================
+
+# --- Render Cron Job Keep-Alive endpoint (HTTP 200 fix) ---
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({"status": "ok", "service": "CloudNest API", "timestamp": now_iso()}), 200
+
+@app.route("/ping", methods=["GET"])
+def ping():
+    """Render cron job এই endpoint hit করবে, HTTP 200 return করবে।"""
+    return jsonify({"status": "pong", "timestamp": now_iso()}), 200
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "healthy"}), 200
+
+# --- Webhook ---
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     if request.headers.get("content-type") == "application/json":
@@ -626,7 +688,7 @@ def api_revoke_session():
     return resp
 
 # =============================================================================
-# EXISTING CLOUDNEST API ROUTES
+# CLOUDNEST API ROUTES
 # =============================================================================
 
 @app.route("/api/otp/send", methods=["POST"])
@@ -852,13 +914,12 @@ def api_ext_url_create():
 
     headers = {"Authorization": EXTERNAL_API_KEY, "Content-Type": "application/json"}
     payload = request.get_json(silent=True) or {}
-    
     payload.pop("api_key", None)
     payload.pop("session_token", None)
-    
+
     try:
         resp = requests.post(f"{EXTERNAL_BASE_URL}/api/create_url", json=payload, headers=headers, timeout=20)
-        if resp.status_code in[200, 201]:
+        if resp.status_code in [200, 201]:
             increment_usage(dev_email, "ext_url_count")
         return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type', 'application/json'))
     except Exception as e:
@@ -911,20 +972,20 @@ def api_ext_file_upload():
     os.makedirs(temp_dir, exist_ok=True)
     filename = os.path.basename(file.filename)
     temp_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}_{filename}")
-    
+
     try:
         file.save(temp_path)
         file_size = os.path.getsize(temp_path)
-        
+
         headers = {"Authorization": EXTERNAL_API_KEY}
         with open(temp_path, 'rb') as f:
             files_payload = {'file': (file.filename, f, file.content_type)}
             resp = requests.post(f"{EXTERNAL_BASE_URL}/api/upload", files=files_payload, headers=headers, timeout=120)
-        
-        if resp.status_code in[200, 201]:
+
+        if resp.status_code in [200, 201]:
             increment_usage(dev_email, "ext_file_count")
             increment_usage(dev_email, "ext_file_storage", file_size)
-            
+
         return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type', 'application/json'))
     except Exception as e:
         return jsonify({"status": "error", "message": f"External File Upload error: {str(e)}"}), 502
@@ -948,7 +1009,6 @@ def api_ext_file_delete(file_id):
     except Exception as e:
         return jsonify({"status": "error", "message": f"External File Delete error: {str(e)}"}), 502
 
-
 # =============================================================================
 # TEMP MAIL ROUTES
 # =============================================================================
@@ -961,7 +1021,7 @@ def api_tempmail_create():
     service = request.args.get("service", "mail.tm")
     account = create_temp_email_account(service)
     if not account: return jsonify({"error": "Failed to create temp email."}), 500
-    all_mails = load_temp_mails(); all_mails.setdefault(api_key,[]).append(account); save_temp_mails(all_mails)
+    all_mails = load_temp_mails(); all_mails.setdefault(api_key, []).append(account); save_temp_mails(all_mails)
     return jsonify(account)
 
 @app.route('/api/tempmail/inbox', methods=['GET'])
@@ -970,7 +1030,7 @@ def api_tempmail_inbox():
     target_email = request.args.get("email")
     dev_email, _ = get_user_by_api_key(api_key)
     if not dev_email: return jsonify({"error": "Invalid API Key or Session"}), 401
-    target_account = next((acc for acc in load_temp_mails().get(api_key,[]) if acc.get("email") == target_email), None)
+    target_account = next((acc for acc in load_temp_mails().get(api_key, []) if acc.get("email") == target_email), None)
     if not target_account: return jsonify({"error": "Access denied."}), 403
     return jsonify(get_temp_email_inbox(target_account['token'], target_account['service']))
 
@@ -980,6 +1040,7 @@ def api_tempmail_inbox():
 
 @app.route('/<path:slug_or_domain>')
 def view_unified_route(slug_or_domain):
+    # /ping, /health etc. conflict হবে না কারণ এগুলো আগে define হয়েছে
     urls_db = load_urls()
     if slug_or_domain in urls_db: return redirect(urls_db[slug_or_domain]["url"])
 
@@ -1000,7 +1061,7 @@ def view_unified_route(slug_or_domain):
         """
         full_html = raw_html + protection_script
         salt = random.randint(10, 50)
-        encoded_array =[(ord(char) + salt) for char in full_html]
+        encoded_array = [(ord(char) + salt) for char in full_html]
         wrapper_html = f"""
         <!DOCTYPE html>
         <html lang="en">
@@ -1043,12 +1104,71 @@ def view_unified_route(slug_or_domain):
 def command_start(message):
     chat_id = str(message.chat.id)
     TEMP_AUTH_STATE.pop(chat_id, None)
-    user_email, user_info = get_logged_in_user(chat_id)
-    if user_email:
-        text = f"🎉 Welcome back!\n\nYour API Key:\n<code>{user_info['api_key']}</code>"
-        bot.send_message(chat_id, text, reply_markup=main_keyboard(chat_id), parse_mode="HTML")
-    else:
-        bot.send_message(chat_id, "Welcome to CloudNest! Please Register or Login.", reply_markup=auth_welcome_keyboard())
+
+    # Ensure admin has is_admin flag
+    ensure_admin_unlimited(chat_id)
+
+    # Auto login/register — no email/password needed
+    user_email, user_info = get_or_create_user_by_chat_id(chat_id)
+
+    is_adm = is_admin(chat_id)
+    adm_badge = "👑 Admin" if is_adm else "👤 User"
+    api_key = user_info['api_key']
+
+    text = (
+        f"☁️ <b>Welcome to CloudNest!</b>\n\n"
+        f"🆔 Your Account: <b>{adm_badge}</b>\n"
+        f"🔑 Your API Key:\n<code>{api_key}</code>\n\n"
+        f"{'♾️ <b>Unlimited Access</b> — All features unlocked!' if is_adm else '📊 Free plan active. Use /help to see features.'}"
+    )
+    bot.send_message(chat_id, text, reply_markup=main_keyboard(chat_id), parse_mode="HTML")
+
+@bot.message_handler(commands=["mykey"])
+def command_mykey(message):
+    chat_id = str(message.chat.id)
+    ensure_admin_unlimited(chat_id)
+    user_email, user_info = get_or_create_user_by_chat_id(chat_id)
+    bot.send_message(chat_id, f"🔑 Your API Key:\n<code>{user_info['api_key']}</code>", parse_mode="HTML")
+
+@bot.message_handler(commands=["help"])
+def command_help(message):
+    chat_id = str(message.chat.id)
+    base = get_public_base_url()
+    text = f"""☁️ <b>CloudNest API Help</b>
+
+<b>Base URL:</b> <code>{base}</code>
+
+📨 <b>OTP:</b>
+<code>POST /api/otp/send</code>
+<code>POST /api/otp/verify</code>
+
+🌐 <b>Web Hosting:</b>
+<code>POST /api/web/upload</code>
+<code>POST /api/web/update</code>
+<code>POST /api/web/delete</code>
+
+🔗 <b>URL Shortener:</b>
+<code>POST /api/url/shorten</code>
+
+🔍 <b>Web Source:</b>
+<code>POST /api/web/source</code>
+
+📧 <b>Temp Mail:</b>
+<code>GET /api/tempmail/create</code>
+<code>GET /api/tempmail/inbox</code>
+
+🗄️ <b>External DB/Auth:</b>
+<code>POST /api/ext/auth/create</code>
+<code>DELETE /api/ext/auth/delete/&lt;key&gt;</code>
+<code>POST /api/ext/url/create</code>
+<code>POST /api/ext/file/upload</code>
+
+🔐 <b>Session:</b>
+<code>POST /api/auth/session</code>
+<code>POST /api/auth/revoke</code>
+
+Use /mykey to see your API Key."""
+    bot.send_message(chat_id, text, parse_mode="HTML")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('admin_') or call.data.startswith('prem_'))
 def handle_callbacks(call):
@@ -1064,6 +1184,8 @@ def handle_callbacks(call):
         return
 
     parts = call.data.split('_', 2)
+    if len(parts) < 3:
+        return
     action, value = parts[1], parts[2]
 
     if action == 'feat':
@@ -1083,7 +1205,10 @@ def handle_callbacks(call):
         codes_db = load_premium_codes()
         codes_db[code] = {"feature": feature, "duration": PREMIUM_DURATIONS.get(value, 86400)}
         save_premium_codes(codes_db)
-        bot.edit_message_text(f"✅ Premium Code Generated!\n\nFeature: `{feature}`\nDuration: `{value}`\n\nCode:\n`{code}`", chat_id, call.message.message_id, parse_mode="Markdown")
+        bot.edit_message_text(
+            f"✅ Premium Code Generated!\n\nFeature: `{feature}`\nDuration: `{value}`\n\nCode:\n`{code}`",
+            chat_id, call.message.message_id, parse_mode="Markdown"
+        )
         ADMIN_PREM_STATE.pop(chat_id, None)
 
 @bot.message_handler(func=lambda message: True)
@@ -1092,79 +1217,35 @@ def handle_messages(message):
     text = (message.text or "").strip()
     if not text: return
 
+    # Auto login করে নেয়
+    ensure_admin_unlimited(chat_id)
+    user_email, user_info = get_or_create_user_by_chat_id(chat_id)
+
+    # Redeem premium state
     auth_state = TEMP_AUTH_STATE.get(chat_id)
-    if auth_state:
-        action, state = auth_state["action"], auth_state["state"]
-
-        if action == "redeem_premium":
-            code = text
-            codes_db = load_premium_codes()
-            if code not in codes_db:
-                bot.send_message(chat_id, "❌ Invalid or expired Premium Code.")
-                if text.lower() == 'cancel': TEMP_AUTH_STATE.pop(chat_id, None)
-                return
-
-            user_email, _ = get_logged_in_user(chat_id)
-            prem_data = codes_db.pop(code); save_premium_codes(codes_db)
-            feature, duration = prem_data["feature"], prem_data["duration"]
-
-            users = load_users(); current_premium = users[user_email].get("premium", {})
-            current_expiry = current_premium.get(feature, time.time())
-            if current_expiry < time.time(): current_expiry = time.time()
-            current_premium[feature] = current_expiry + duration
-            users[user_email]["premium"] = current_premium; save_users(users)
-
+    if auth_state and auth_state.get("action") == "redeem_premium":
+        if text.lower() == 'cancel':
             TEMP_AUTH_STATE.pop(chat_id, None)
-            bot.send_message(chat_id, f"💎 Success! Premium applied for: **{feature.upper()}**", parse_mode="Markdown", reply_markup=main_keyboard(chat_id))
+            bot.send_message(chat_id, "❌ Cancelled.", reply_markup=main_keyboard(chat_id))
+            return
+        code = text
+        codes_db = load_premium_codes()
+        if code not in codes_db:
+            bot.send_message(chat_id, "❌ Invalid or expired Premium Code.")
             return
 
-        if action in ["register", "login"]:
-            if state == "await_email":
-                if "@" not in text or "." not in text:
-                    bot.send_message(chat_id, "❌ Invalid email format."); return
-                if action == "register" and text in load_users():
-                    bot.send_message(chat_id, "❌ Email already registered.", reply_markup=auth_welcome_keyboard()); TEMP_AUTH_STATE.pop(chat_id, None); return
-                if action == "login" and text not in load_users():
-                    bot.send_message(chat_id, "❌ Email not found.", reply_markup=auth_welcome_keyboard()); TEMP_AUTH_STATE.pop(chat_id, None); return
+        prem_data = codes_db.pop(code); save_premium_codes(codes_db)
+        feature, duration = prem_data["feature"], prem_data["duration"]
 
-                bot.send_message(chat_id, "Sending verification OTP...")
-                otp = str(random.randint(100000, 999999))
-                if send_premium_otp_email(text, otp):
-                    TEMP_AUTH_STATE[chat_id].update({"email": text, "otp": otp, "state": "await_otp"})
-                    bot.send_message(chat_id, "✅ OTP Sent! Check your email and enter the code:")
-                else:
-                    bot.send_message(chat_id, "❌ Failed to send OTP.", reply_markup=auth_welcome_keyboard()); TEMP_AUTH_STATE.pop(chat_id, None)
-                return
+        users = load_users()
+        current_premium = users[user_email].get("premium", {})
+        current_expiry = current_premium.get(feature, time.time())
+        if current_expiry < time.time(): current_expiry = time.time()
+        current_premium[feature] = current_expiry + duration
+        users[user_email]["premium"] = current_premium; save_users(users)
 
-            if state == "await_otp":
-                if text != auth_state.get("otp"): bot.send_message(chat_id, "❌ Incorrect OTP."); return
-
-                email = auth_state["email"]
-                users, sessions = load_users(), load_sessions()
-
-                if action == "register":
-                    api_key = "cn_" + uuid.uuid4().hex
-                    users[email] = {"email": email, "api_key": api_key, "created_at": now_iso(), "usage": {}, "premium": {}}
-                    save_users(users)
-
-                sessions[chat_id] = email; save_sessions(sessions)
-                TEMP_AUTH_STATE.pop(chat_id, None)
-                api_key = users[email]["api_key"]
-
-                msg = f"🎉 Successfully {'Registered' if action == 'register' else 'Logged in'}!\n\nAPI Key:\n<code>{api_key}</code>"
-                bot.send_message(chat_id, msg, reply_markup=main_keyboard(chat_id), parse_mode="HTML")
-                return
-
-    if text == "Register": TEMP_AUTH_STATE[chat_id] = {"action": "register", "state": "await_email"}; bot.send_message(chat_id, "Enter email to register:", reply_markup=types.ReplyKeyboardRemove()); return
-    if text == "Login": TEMP_AUTH_STATE[chat_id] = {"action": "login", "state": "await_email"}; bot.send_message(chat_id, "Enter registered email:", reply_markup=types.ReplyKeyboardRemove()); return
-
-    user_email, user_info = get_logged_in_user(chat_id)
-    if not user_email: bot.send_message(chat_id, "You are not logged in.", reply_markup=auth_welcome_keyboard()); return
-
-    if text == "Logout":
-        sessions = load_sessions()
-        if chat_id in sessions: del sessions[chat_id]; save_sessions(sessions)
-        bot.send_message(chat_id, "✅ Logged out.", reply_markup=auth_welcome_keyboard())
+        TEMP_AUTH_STATE.pop(chat_id, None)
+        bot.send_message(chat_id, f"💎 Success! Premium applied for: *{feature.upper()}*", parse_mode="Markdown", reply_markup=main_keyboard(chat_id))
         return
 
     if text == "💎 Redeem Premium":
@@ -1184,6 +1265,23 @@ def handle_messages(message):
             bot.send_message(chat_id, "Select Feature for Premium Code:", reply_markup=markup)
             return
 
+        if text == "👑 Admin Panel":
+            users = load_users()
+            total_users = len([u for u in users.values() if not u.get("is_admin")])
+            total_sites = len(load_web_db())
+            total_urls = len(load_urls())
+            api_key = user_info['api_key']
+            msg = (
+                f"👑 <b>Admin Panel</b>\n\n"
+                f"👥 Total Users: <b>{total_users}</b>\n"
+                f"🌐 Total Websites: <b>{total_sites}</b>\n"
+                f"🔗 Total Short URLs: <b>{total_urls}</b>\n\n"
+                f"🔑 Your Admin API Key:\n<code>{api_key}</code>\n\n"
+                f"♾️ <b>All limits are UNLIMITED for Admin.</b>"
+            )
+            bot.send_message(chat_id, msg, parse_mode="HTML")
+            return
+
         if text == "🗑️ Clear Database":
             markup = types.InlineKeyboardMarkup(row_width=2).add(
                 types.InlineKeyboardButton("✅ Confirm Clear All", callback_data="admin_clear_db"),
@@ -1193,15 +1291,16 @@ def handle_messages(message):
             return
 
     if text == "📧 Temp Mail":
-        user_mails = load_temp_mails().get(user_info['api_key'],[])
+        user_mails = load_temp_mails().get(user_info['api_key'], [])
         msg = "You have no temp emails." if not user_mails else "📧 Your Temp Emails:\n\n" + "\n".join([f"`{m['email']}`" for m in user_mails])
         bot.send_message(chat_id, msg, parse_mode="Markdown")
 
     elif text == "🌐 Your Websites":
-        user_sites =[dom for dom, data in load_web_db().items() if data.get("creator_api_key") == user_info['api_key']]
-        user_urls =[slug for slug, data in load_urls().items() if data.get("creator_api_key") == user_info['api_key']]
-        msg = "🌐 Your Websites:\n" + ("None" if not user_sites else "\n".join([f"🔹 {get_public_base_url()}/{dom}" for dom in user_sites]))
-        msg += "\n\n🔗 Your Short URLs:\n" + ("None" if not user_urls else "\n".join([f"🔸 {get_public_base_url()}/{s}" for s in user_urls]))
+        user_sites = [dom for dom, data in load_web_db().items() if data.get("creator_api_key") == user_info['api_key']]
+        user_urls = [slug for slug, data in load_urls().items() if data.get("creator_api_key") == user_info['api_key']]
+        base = get_public_base_url()
+        msg = "🌐 Your Websites:\n" + ("None" if not user_sites else "\n".join([f"🔹 {base}/{dom}" for dom in user_sites]))
+        msg += "\n\n🔗 Your Short URLs:\n" + ("None" if not user_urls else "\n".join([f"🔸 {base}/{s}" for s in user_urls]))
         bot.send_message(chat_id, msg + "\n\n" + usage_summary(user_info))
 
     elif text == "⚙️ Project Settings":
@@ -1222,10 +1321,9 @@ Base URL: {base}
 Your API Key: {api_key}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━
-🗄️ EXT DB & AUTH (Proxy to Premium)
+🗄️ EXT DB & AUTH
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 POST /api/ext/auth/create
-  (Pass api_key in Session or URL)
 DELETE /api/ext/auth/delete/<ext_api_key>?api_key={api_key}
 
 POST /api/ext/url/create
@@ -1235,14 +1333,14 @@ DELETE /api/ext/url/delete/<short_id>?api_key={api_key}
 POST /api/ext/db_reset?api_key={api_key}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━
-📁 EXT FILES (Proxy)
+📁 EXT FILES
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 POST /api/ext/file/upload
   Form-Data: file=<your_file>, api_key="{api_key}"
 DELETE /api/ext/file/delete/<file_id>?api_key={api_key}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━
-🔐 SESSION (Secure frontend use)
+🔐 SESSION
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 POST /api/auth/session
   Body: {{"api_key": "...", "ttl": 3600}}
@@ -1252,7 +1350,6 @@ POST /api/auth/session
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 POST /api/otp/send
   Body: {{"api_key": "...", "email": "user@ex.com"}}
-
 POST /api/otp/verify
   Body: {{"api_key": "...", "email": "...", "otp": "123456"}}
 
@@ -1280,8 +1377,22 @@ POST /api/url/shorten
 GET /api/tempmail/create?api_key=...&service=mail.tm
 GET /api/tempmail/inbox?api_key=...&email=abc@mail.tm
 """
-        msg = f"⚙️ **Project Settings**\n\n```\n{inst}\n```\n\n📊 **External Backend Usage:**\n- Files Uploaded: {ext_file_count}\n- Total Storage Used: {storage_str}\n- Auths Created: {ext_auth_count}\n- URLs Created: {ext_url_count}\n\n**Usage:**\n{usage_summary(user_info)}"
+        is_adm = user_info.get("is_admin", False)
+        msg = f"⚙️ *Project Settings*\n\n```\n{inst}\n```\n\n📊 *External Backend Usage:*\n- Files Uploaded: {ext_file_count}\n- Total Storage Used: {storage_str}\n- Auths Created: {ext_auth_count}\n- URLs Created: {ext_url_count}\n\n*Usage:*\n{usage_summary(user_info)}"
         bot.send_message(chat_id, msg, parse_mode="Markdown")
 
+    else:
+        # Unknown command
+        bot.send_message(chat_id, "ℹ️ Use the buttons below or type /help", reply_markup=main_keyboard(chat_id))
+
+
+# =============================================================================
+# RENDER ENTRY POINT
+# Render এ gunicorn ব্যবহার হয়:
+#   gunicorn cloudnest:app
+# Local test এর জন্য:
+#   python cloudnest.py
+# =============================================================================
 if __name__ == "__main__":
-    app.run(debug=False, host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=False, host="0.0.0.0", port=port)
