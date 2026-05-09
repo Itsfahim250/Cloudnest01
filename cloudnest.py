@@ -2,7 +2,6 @@ import json
 import os
 import time
 import uuid
-import smtplib
 import random
 import requests
 import string
@@ -12,8 +11,6 @@ import hmac
 import hashlib
 import secrets
 from datetime import datetime, timezone, timedelta
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 import telebot
 from telebot import apihelper
@@ -36,9 +33,14 @@ if not BOT_TOKEN:
 
 ADMIN_CHAT_IDS = {x.strip() for x in ADMIN_CHAT_IDS_RAW.split(",") if x.strip()}
 
-# SMTP CONFIG
-SMTP_EMAIL    = "cloudnestotp@gmail.com"
-SMTP_PASSWORD = "smeu dhdn zdou yfwc"   # Gmail App Password (spaces are intentional)
+# =============================================================================
+# BACKEND (backend.py) FORWARDING CONFIG
+# Replace these placeholders before deploying.
+# BACKEND_URL  → The full base URL of your backend.py server (e.g. http://your-vps-ip:5000)
+# BACKEND_API_KEY → The MASTER_API_KEY value set in backend.py
+# =============================================================================
+BACKEND_URL     = "http://109.199.121.213:5000"       # e.g. "http://109.199.121.213:5000"
+BACKEND_API_KEY = "LdAUCkf3fi2B"   # e.g. "LdAUCkf3fi2B"
 
 DATA_DIR            = os.path.join(BASE_DIR, "data")
 USER_DATA_FILE      = os.path.join(DATA_DIR, "users.json")
@@ -57,7 +59,7 @@ app.secret_key = secrets.token_hex(32)
 CORS(app, supports_credentials=True)
 
 # =============================================================================
-# EXTERNAL BACKEND CONFIGURATION  (test.py VPS)
+# EXTERNAL BACKEND CONFIGURATION  (test.py VPS — file/bot storage)
 # =============================================================================
 EXTERNAL_BASE_URL = "http://109.199.121.213:5000"
 EXTERNAL_API_KEY  = "LdAUCkf3fi2B"
@@ -330,183 +332,45 @@ def ensure_admin_unlimited(chat_id):
             save_users(users)
 
 # =============================================================================
-# SMTP HELPERS — fixed
+# OTP FORWARDING HELPER
+# Forwards the OTP send request to backend.py instead of sending mail directly.
+# template: 1 = Free tier (basic template), 2 = Premium tier (rich template)
 # =============================================================================
 
-def _smtp_send(to_email: str, msg: MIMEMultipart) -> bool:
+def forward_otp_send(to_email: str, otp_code: str, template: int) -> bool:
     """
-    Reliable SMTP send helper.
-    Fixes:
-      - Uses a fresh connection each call (avoids stale socket issues)
-      - Removes spaces from App Password before login (Gmail App Passwords must
-        have spaces stripped when passed programmatically)
-      - Proper exception handling so callers always get True/False
+    Forwards the OTP sending task to backend.py via an HTTP POST request.
+
+    Args:
+        to_email  : Recipient email address.
+        otp_code  : The 6-digit OTP string to send.
+        template  : 1 = Free tier email template, 2 = Premium tier email template.
+
+    Returns:
+        True if backend.py reports success, False otherwise.
     """
-    password_clean = SMTP_PASSWORD.replace(" ", "")  # strip spaces from app password
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(SMTP_EMAIL, password_clean)
-            server.sendmail(SMTP_EMAIL, to_email, msg.as_string())
-        return True
-    except smtplib.SMTPAuthenticationError:
-        print("[SMTP] Authentication failed — check Gmail App Password.")
+        response = requests.post(
+            f"{BACKEND_URL}/api/otp/send",
+            json={
+                "api_key":  BACKEND_API_KEY,
+                "email":    to_email,
+                "otp":      otp_code,
+                "template": template,
+            },
+            timeout=15,
+        )
+        result = response.json()
+        return result.get("status") == "success"
+    except requests.exceptions.ConnectionError:
+        print(f"[OTP Forward] Connection error — backend unreachable at {BACKEND_URL}")
         return False
-    except smtplib.SMTPException as e:
-        print(f"[SMTP] SMTPException: {e}")
+    except requests.exceptions.Timeout:
+        print("[OTP Forward] Request to backend timed out.")
         return False
     except Exception as e:
-        print(f"[SMTP] Unexpected error: {e}")
+        print(f"[OTP Forward] Unexpected error: {e}")
         return False
-
-
-def send_premium_otp_email(to_email, otp_code):
-    msg            = MIMEMultipart("alternative")
-    msg['Subject'] = f"{otp_code} is your CloudNest account recovery code"
-    msg['From']    = SMTP_EMAIL
-    msg['To']      = to_email
-
-    html = f"""
-    <table border="0" cellpadding="0" cellspacing="0" width="100%"
-           style="background-color:#f0f2f5;padding:40px 0;
-                  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-      <tr><td align="center">
-        <table border="0" cellpadding="0" cellspacing="0" width="100%"
-               style="background-color:#ffffff;border-radius:8px;
-                      box-shadow:0 2px 4px rgba(0,0,0,0.1);overflow:hidden;max-width:500px;">
-          <tr>
-            <td align="center" style="background-color:#1877f2;padding:25px;">
-              <h1 style="color:#ffffff;margin:0;font-size:26px;font-weight:700;letter-spacing:1px;">CloudNest</h1>
-            </td>
-          </tr>
-          <tr>
-            <td align="center" style="padding:40px 30px;">
-              <h2 style="color:#1c1e21;font-size:20px;margin:0 0 15px 0;font-weight:600;">Authentication Required</h2>
-              <p style="color:#606770;font-size:15px;margin:0 0 25px 0;line-height:1.5;">
-                Enter the code below to verify your CloudNest account:
-              </p>
-              <div style="background-color:#e7f3ff;border:1px solid #1877f2;border-radius:6px;
-                          padding:15px 30px;display:inline-block;margin-bottom:25px;">
-                <span style="color:#1877f2;font-size:36px;font-weight:bold;letter-spacing:5px;">{otp_code}</span>
-              </div>
-              <p style="color:#8a8d91;font-size:13px;margin:0;line-height:1.4;">
-                If you didn't request this code, you can safely ignore this email.
-              </p>
-            </td>
-          </tr>
-        </table>
-      </td></tr>
-    </table>
-    """
-    msg.attach(MIMEText(html, "html"))
-    return _smtp_send(to_email, msg)
-
-
-def send_api_otp_email(to_email, otp_code, is_premium_user=False):
-    msg         = MIMEMultipart("alternative")
-    msg['From'] = SMTP_EMAIL
-    msg['To']   = to_email
-
-    if is_premium_user:
-        msg['Subject'] = f"{otp_code} — Your Verification Code"
-        html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
-<body style="margin:0;padding:0;background-color:#f0f2f5;
-             font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-<table width="100%" cellpadding="0" cellspacing="0" border="0"
-       style="background-color:#f0f2f5;padding:40px 0;">
-  <tr><td align="center">
-    <table width="500" cellpadding="0" cellspacing="0" border="0"
-           style="background:#ffffff;border-radius:10px;overflow:hidden;
-                  box-shadow:0 4px 16px rgba(0,0,0,0.08);max-width:500px;width:100%;">
-      <tr>
-        <td align="center"
-            style="background:linear-gradient(135deg,#1877f2 0%,#0a5bbf 100%);padding:32px 24px;">
-          <div style="display:inline-block;background:rgba(255,255,255,0.15);
-                      border-radius:12px;padding:10px 24px;">
-            <span style="color:#ffffff;font-size:22px;font-weight:800;letter-spacing:2px;">CloudNest</span>
-          </div>
-        </td>
-      </tr>
-      <tr>
-        <td style="padding:40px 40px 32px 40px;text-align:center;">
-          <h2 style="color:#1c1e21;font-size:22px;font-weight:700;margin:0 0 10px;">Security Verification</h2>
-          <p style="color:#606770;font-size:14px;line-height:1.6;margin:0 0 28px;">
-            Use this one-time code to complete your verification.
-          </p>
-          <div style="background:#f0f7ff;border:2px solid #1877f2;border-radius:10px;
-                      padding:18px 36px;display:inline-block;margin-bottom:28px;">
-            <span style="color:#1877f2;font-size:40px;font-weight:800;letter-spacing:8px;
-                         font-family:'Courier New',monospace;">{otp_code}</span>
-          </div>
-          <p style="color:#bec3c9;font-size:12px;margin:0;line-height:1.5;">
-            ⏱ This code expires in <strong>5 minutes</strong>.
-          </p>
-        </td>
-      </tr>
-    </table>
-  </td></tr>
-</table>
-</body>
-</html>"""
-    else:
-        msg['Subject'] = f"Your Verification Code: {otp_code}"
-        html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
-<body style="margin:0;padding:0;background:#f4f6fb;
-             font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;">
-<table width="100%" cellpadding="0" cellspacing="0" border="0"
-       style="background:#f4f6fb;padding:36px 0;">
-  <tr><td align="center">
-    <table width="480" cellpadding="0" cellspacing="0" border="0"
-           style="background:#ffffff;border-radius:10px;overflow:hidden;
-                  box-shadow:0 2px 12px rgba(0,0,0,0.07);max-width:480px;width:100%;">
-      <tr>
-        <td style="background:#1877f2;height:5px;padding:0;font-size:0;line-height:0;">&nbsp;</td>
-      </tr>
-      <tr>
-        <td style="padding:36px 36px 24px;text-align:center;">
-          <p style="color:#606770;font-size:14px;margin:0 0 6px;">Your verification code is</p>
-          <div style="background:#f0f7ff;border:1.5px solid #1877f2;border-radius:8px;
-                      padding:14px 32px;display:inline-block;margin:12px 0 20px;">
-            <span style="color:#1877f2;font-size:38px;font-weight:800;letter-spacing:7px;
-                         font-family:'Courier New',monospace;">{otp_code}</span>
-          </div>
-          <p style="color:#8a8d91;font-size:13px;margin:0 0 4px;">
-            Valid for <strong>5 minutes</strong>. Do not share this code.
-          </p>
-        </td>
-      </tr>
-      <tr><td style="padding:0 36px;"><div style="border-top:1px solid #eaeaea;"></div></td></tr>
-      <tr>
-        <td style="padding:20px 36px 28px;text-align:center;background:#fafbfc;">
-          <p style="font-size:12px;color:#adb5bd;margin:0 0 10px;">Powered by</p>
-          <div style="display:inline-block;background:#ffffff;border:1px solid #e4e6ea;
-                      border-radius:8px;padding:10px 22px;">
-            <span style="font-size:15px;font-weight:700;color:#1877f2;letter-spacing:0.5px;">☁️ CloudNest</span>
-            <span style="display:block;font-size:11px;color:#8a8d91;margin-top:4px;">
-              Telegram:&nbsp;
-              <a href="https://t.me/CloudNest_Bot"
-                 style="color:#1877f2;text-decoration:none;font-weight:600;">@CloudNest_Bot</a>
-            </span>
-          </div>
-          <p style="font-size:11px;color:#ced4da;margin:12px 0 0;">
-            Upgrade to Premium for a watermark-free experience.
-          </p>
-        </td>
-      </tr>
-    </table>
-  </td></tr>
-</table>
-</body>
-</html>"""
-
-    msg.attach(MIMEText(html, "html"))
-    return _smtp_send(to_email, msg)
 
 # =============================================================================
 # TEMP MAIL TOOLS
@@ -720,6 +584,8 @@ def api_revoke_session():
 
 # =============================================================================
 # OTP ROUTES
+# The gateway receives the request, validates the user, generates the OTP,
+# then delegates the actual email delivery to backend.py via forward_otp_send().
 # =============================================================================
 
 @app.route("/api/otp/send", methods=["POST"])
@@ -727,6 +593,7 @@ def api_otp_send():
     data         = request.get_json(silent=True) or {}
     target_email = data.get("email", "")
 
+    # --- Auth & rate-limit check ---
     api_key               = get_api_key_from_request(request)
     dev_email, user_info  = get_user_by_api_key(api_key)
     if not dev_email:
@@ -736,15 +603,21 @@ def api_otp_send():
     if not allowed:
         return jsonify({"status": "error", "message": "OTP limit reached."}), 429
 
-    otp_code   = str(random.randint(100000, 999999))
-    is_prem    = is_premium(user_info, "otp_sends")
-    if send_api_otp_email(target_email, otp_code, is_premium_user=is_prem):
+    # --- Generate OTP & determine email template tier ---
+    otp_code = str(random.randint(100000, 999999))
+    # template=2 → Premium rich email, template=1 → Free basic email
+    template = 2 if is_premium(user_info, "otp_sends") else 1
+
+    # --- Forward send request to backend.py ---
+    if forward_otp_send(target_email, otp_code, template):
         DEV_OTPS[f"{api_key}_{target_email}"] = {
             "otp":     otp_code,
             "expires": time.time() + 300,
         }
         return jsonify({"status": "success", "message": "OTP sent."})
-    return jsonify({"status": "error", "message": "Failed to send email. Check SMTP config."}), 500
+
+    return jsonify({"status": "error", "message": "Failed to send email. Backend service unavailable."}), 500
+
 
 @app.route("/api/otp/verify", methods=["POST"])
 def api_otp_verify():
@@ -898,7 +771,6 @@ def api_web_source():
     resp, strategy_used, error_msg = _smart_fetch(target_url)
 
     if resp is None:
-        # Refund the usage count on failure
         users = load_users()
         u     = users.get(dev_email, {})
         if not is_premium(u, "web_source"):
@@ -912,8 +784,8 @@ def api_web_source():
     try:    source_code = resp.content.decode(encoding, errors="replace")
     except: source_code = resp.content.decode("utf-8", errors="replace")
 
-    src_lower   = source_code.lower()
-    line_count  = source_code.count("\n") + 1
+    src_lower    = source_code.lower()
+    line_count   = source_code.count("\n") + 1
     script_count = src_lower.count("<script")
     style_count  = src_lower.count("<style")
     link_count   = src_lower.count("<link")
@@ -984,7 +856,7 @@ def api_tempmail_inbox():
     return jsonify(get_temp_email_inbox(target_account['token'], target_account['service']))
 
 # =============================================================================
-# EXTERNAL FILE PROXY ROUTES  (test.py VPS — file storage only)
+# EXTERNAL FILE PROXY ROUTES  (backend.py VPS — file storage only)
 # =============================================================================
 
 def _increment_ext_usage(user_email, metric, amount=1):
@@ -1062,15 +934,11 @@ def api_ext_file_delete(file_id):
         return jsonify({"status": "error", "message": f"External File Delete error: {str(e)}"}), 502
 
 # =============================================================================
-# BOT HOSTING PROXY ROUTES  (proxied to test.py VPS)
+# BOT HOSTING PROXY ROUTES  (proxied to backend.py VPS)
 # =============================================================================
 
 @app.route('/api/ext/bot/upload', methods=['POST'])
 def api_ext_bot_upload():
-    """
-    Upload a bot to the external VPS (test.py).
-    Form fields forwarded: main_py (required), requirements_txt (optional), bot_name (optional).
-    """
     api_key              = get_api_key_from_request(request)
     dev_email, _         = get_user_by_api_key(api_key)
     if not dev_email:
@@ -1153,10 +1021,6 @@ def api_ext_bot_stop(bot_id):
 
 @app.route('/api/ext/bot/console/<bot_id>', methods=['GET'])
 def api_ext_bot_console(bot_id):
-    """
-    Proxies the console log from test.py VPS.
-    Query params: lines=100 (optional), stream=true (SSE, optional)
-    """
     api_key              = get_api_key_from_request(request)
     dev_email, _         = get_user_by_api_key(api_key)
     if not dev_email:
@@ -1168,7 +1032,6 @@ def api_ext_bot_console(bot_id):
 
     try:
         if stream_param.lower() == "true":
-            # Forward SSE stream from test.py
             upstream = requests.get(
                 f"{EXTERNAL_BASE_URL}/api/bot/console/{bot_id}",
                 params={"lines": lines_param, "stream": "true"},
@@ -1385,7 +1248,6 @@ def handle_messages(message):
     ensure_admin_unlimited(chat_id)
     user_email, user_info = get_or_create_user_by_chat_id(chat_id)
 
-    # Redeem premium flow
     auth_state = TEMP_AUTH_STATE.get(chat_id)
     if auth_state and auth_state.get("action") == "redeem_premium":
         if text.lower() == 'cancel':
@@ -1542,7 +1404,6 @@ POST /api/ext/bot/upload
 POST /api/ext/bot/start/<bot_id>?api_key={api_key}
 POST /api/ext/bot/stop/<bot_id>?api_key={api_key}
 GET  /api/ext/bot/console/<bot_id>?api_key={api_key}&lines=100
-GET  /api/ext/bot/console/<bot_id>?api_key={api_key}&stream=true  (SSE)
 
 ━━ Session ━━━━━━━━━━━━━━━━━━━━━━━━
 POST /api/auth/session
@@ -1565,7 +1426,7 @@ POST /api/auth/session
 # =============================================================================
 # ENTRY POINT
 # gunicorn: gunicorn cloudnest:app
-# local:    python main.py
+# local:    python cloudnest.py
 # =============================================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
