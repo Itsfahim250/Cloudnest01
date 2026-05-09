@@ -1,6 +1,10 @@
-pyTelegramBotAPI
-Flask
-Flask-Cors
-python-dotenv
-requests
-gunicorn
+# cloudnest_requirements.txt
+# Dependencies for cloudnest.py (API Gateway / Bot Server)
+# Install with: pip install -r cloudnest_requirements.txt
+
+flask==3.0.3
+flask-cors==4.0.1
+pyTelegramBotAPI==4.21.0
+python-dotenv==1.0.1
+requests==2.32.3
+gunicorn==22.0.0
