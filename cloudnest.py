@@ -39,7 +39,7 @@ ADMIN_CHAT_IDS = {x.strip() for x in ADMIN_CHAT_IDS_RAW.split(",") if x.strip()}
 # BACKEND_URL  → The full base URL of your backend.py server (e.g. http://your-vps-ip:5000)
 # BACKEND_API_KEY → The MASTER_API_KEY value set in backend.py
 # =============================================================================
-BACKEND_URL     = "http://109.199.121.213:5000"       # e.g. "http://109.199.121.213:5000"
+BACKEND_URL     = "http://109.199.121.213:8085"       # e.g. "http://109.199.121.213:5000"
 BACKEND_API_KEY = "LdAUCkf3fi2B"   # e.g. "LdAUCkf3fi2B"
 
 DATA_DIR            = os.path.join(BASE_DIR, "data")
