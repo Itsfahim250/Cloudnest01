@@ -61,7 +61,7 @@ CORS(app, supports_credentials=True)
 # =============================================================================
 # EXTERNAL BACKEND CONFIGURATION  (test.py VPS — file/bot storage)
 # =============================================================================
-EXTERNAL_BASE_URL = "http://109.199.121.213:5000"
+EXTERNAL_BASE_URL = "http://20.192.21.48:5000"
 EXTERNAL_API_KEY  = "LdAUCkf3fi2B"
 
 # =============================================================================
